@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SitSmart Edge</title>
+<style>
+  :root { --bg:#f4f7f5; --card:#fff; --ink:#1c2b25; --muted:#66756e; --line:#dfe7e2; --accent:#1f7a4d; --bad:#b3261e; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#0f1613; --card:#18221e; --ink:#e5eee9; --muted:#93a39b; --line:#28362f; --accent:#6fd6a0; --bad:#ff8f86; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.45 system-ui,sans-serif; }
+  main { max-width:480px; margin:0 auto; padding:20px 16px 40px; display:grid; gap:14px; }
+  h1 { font-size:20px; margin:0; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  label { display:block; font-size:13px; color:var(--muted); margin:10px 0 4px; }
+  input, select { width:100%; font:inherit; padding:9px 10px; border-radius:8px; border:1px solid var(--line); background:var(--bg); color:var(--ink); }
+  button { width:100%; margin-top:14px; font:inherit; font-weight:700; padding:12px; border-radius:10px; border:0; background:var(--accent); color:#fff; }
+  @media (prefers-color-scheme: dark) { button { color:#0f1613; } }
+  button.stop { background:var(--bad); }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:4px 14px; margin:0; }
+  dt { color:var(--muted); } dd { margin:0; font-weight:600; font-variant-numeric:tabular-nums; }
+  #alert { display:none; background:var(--bad); color:#fff; padding:14px; border-radius:12px; font-weight:700; }
+  .hint { font-size:13px; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>SitSmart Edge</h1>
+  <div id="alert"></div>
+
+  <section class="card">
+    <label for="pid">PROJECT_ID (samakan dengan laptop)</label>
+    <input id="pid" value="sitsmart_demo" autocapitalize="off" autocorrect="off">
+    <label for="edge">Peran HP ini</label>
+    <select id="edge">
+      <option value="1">Edge 1 · HP badan (kantong dada / ikat di punggung)</option>
+      <option value="2">Edge 2 · HP kursi (taruh di dudukan kursi)</option>
+    </select>
+    <label for="url">Broker (MQTT over WebSocket)</label>
+    <input id="url" value="wss://broker.hivemq.com:8884/mqtt" autocapitalize="off">
+    <button id="go">Mulai membaca sensor</button>
+    <p class="hint">Halaman ini harus dibuka lewat HTTPS agar browser mengizinkan sensor gerak. Jangan kirim data rahasia ke broker publik.</p>
+  </section>
+
+  <section class="card">
+    <dl>
+      <dt>Sensor</dt><dd id="o-sensor">belum jalan</dd>
+      <dt>MQTT</dt><dd id="o-mqtt">–</dd>
+      <dt>Gerakan (RMS)</dt><dd id="o-rms">–</dd>
+      <dt>Rotasi (gyro)</dt><dd id="o-rot">–</dd>
+      <dt>Gravitasi x,y,z</dt><dd id="o-g">–</dd>
+      <dt>Pesan terkirim</dt><dd id="o-n">0</dd>
+    </dl>
+  </section>
+</main>
+
+<script src="https://unpkg.com/mqtt@5/dist/mqtt.min.js"></script>
+<script>
+const $ = (id) => document.getElementById(id);
+let running = false, client = null, sent = 0, wakeLock = null, timer = null;
+let accMags = [], accGrav = [], rotSum = 0, lastMotionT = null, gotGyro = false;
+
+/* ---- PROSES 1 (di edge): sama persis dengan shared/processing.py ---- */
+function windowRms(a) {
+  if (!a.length) return 0;
+  const m = a.reduce((s, v) => s + v, 0) / a.length;
+  return Math.sqrt(a.reduce((s, v) => s + (v - m) ** 2, 0) / a.length);
+}
+function meanVector(vs) {
+  if (!vs.length) return [0, 0, 0];
+  return [0, 1, 2].map((i) => vs.reduce((s, v) => s + v[i], 0) / vs.length);
+}
+
+function onMotion(e) {
+  const g = e.accelerationIncludingGravity;
+  if (!g || g.x == null) return;
+  accMags.push(Math.hypot(g.x, g.y, g.z));
+  accGrav.push([g.x, g.y, g.z]);
+  const r = e.rotationRate;
+  const now = performance.now();
+  if (r && r.alpha != null) {
+    gotGyro = true;
+    const dt = lastMotionT ? (now - lastMotionT) / 1000 : 0;
+    // rotationRate dalam derajat/detik -> radian
+    rotSum += Math.hypot(r.alpha, r.beta, r.gamma) * (Math.PI / 180) * dt;
+  }
+  lastMotionT = now;
+}
+
+function tick() {
+  if (!accMags.length) { $("o-sensor").textContent = "tidak ada data gerak!"; return; }
+  const rms = windowRms(accMags), grav = meanVector(accGrav), rot = rotSum;
+  accMags = []; accGrav = []; rotSum = 0;
+  $("o-sensor").textContent = gotGyro ? "accelerometer + gyroscope" : "accelerometer saja (gyro tidak ada)";
+  $("o-rms").textContent = rms.toFixed(3) + " m/s²";
+  $("o-rot").textContent = rot.toFixed(3) + " rad";
+  $("o-g").textContent = grav.map((v) => v.toFixed(1)).join(", ");
+  if (client && client.connected) {
+    const edge = $("edge").value, pid = $("pid").value.trim();
+    client.publish(`sitsmart/${pid}/edge/${edge}/telemetry`,
+      JSON.stringify({ edge: Number(edge), ts: Date.now(), rms, rot, gravity: grav }));
+    $("o-n").textContent = ++sent;
+  }
+}
+
+function showAlert(a) {
+  const box = $("alert");
+  box.style.display = "block";
+  box.textContent = (a.type === "SLOUCH" ? "Tegakkan badanmu! " : "Saatnya berdiri & bergerak! ") + a.reason;
+  if (navigator.vibrate) navigator.vibrate([300, 150, 300]);
+  clearTimeout(showAlert.t);
+  showAlert.t = setTimeout(() => (box.style.display = "none"), 8000);
+}
+
+async function start() {
+  if (typeof DeviceMotionEvent !== "undefined" && typeof DeviceMotionEvent.requestPermission === "function") {
+    const res = await DeviceMotionEvent.requestPermission(); // iOS Safari
+    if (res !== "granted") { $("o-sensor").textContent = "izin gerak ditolak"; return; }
+  }
+  window.addEventListener("devicemotion", onMotion);
+  const pid = $("pid").value.trim(), edge = $("edge").value;
+  client = mqtt.connect($("url").value.trim(), { clientId: `sitsmart-edge${edge}-` + Math.random().toString(16).slice(2, 8) });
+  client.on("connect", () => {
+    $("o-mqtt").textContent = "terhubung";
+    // Hanya HP badan yang menerima alert (getar di badan pengguna)
+    if (edge === "1") client.subscribe(`sitsmart/${pid}/alerts`);
+  });
+  client.on("close", () => ($("o-mqtt").textContent = "terputus"));
+  client.on("message", (t, p) => { try { showAlert(JSON.parse(p.toString())); } catch {} });
+  timer = setInterval(tick, 1000);
+  try { wakeLock = await navigator.wakeLock?.request("screen"); } catch {}
+  running = true;
+  $("go").textContent = "Berhenti"; $("go").className = "stop";
+}
+
+function stop() {
+  window.removeEventListener("devicemotion", onMotion);
+  clearInterval(timer);
+  if (client) client.end();
+  if (wakeLock) wakeLock.release().catch(() => {});
+  running = false; sent = 0;
+  $("o-mqtt").textContent = "–"; $("o-sensor").textContent = "belum jalan";
+  $("go").textContent = "Mulai membaca sensor"; $("go").className = "";
+}
+
+$("go").onclick = () => (running ? stop() : start());
+</script>
+</body>
+</html>
